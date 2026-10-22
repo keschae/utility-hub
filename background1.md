@@ -647,5 +647,88 @@ I can't tell from here what the clipboard will contain or whether it comes out a
 
 If the command isn't recognized, you may be in the VS Code extension rather than the TUI. In that case, run `/help` to see which commands your build supports.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ---
 
+This is a conceptual question about Entra and doesn't need anything from the codebase, so I'll answer from general knowledge. Microsoft changes licensing and sync details often, so check the specifics against current Microsoft documentation.
+
+## Short answer
+
+For this app, the groups that matter are the ones that exist in **Entra ID** (the cloud directory). Your Express API never talks to Active Directory on your local servers. Entra reads group membership and puts the result in the token. Where a group originally comes from only affects how it gets into Entra and how you manage it.
+
+## The three places a group can come from
+
+| Group origin | Where it's managed | How it reaches Entra |
+|---|---|---|
+| **Cloud-only** | Entra admin center (or Graph/PowerShell) | It already lives in Entra |
+| **On-premises AD, synced** | Active Directory Users and Computers on your domain controllers | Microsoft Entra Connect (Connect Sync) or Entra Cloud Sync copies it to Entra |
+| **Dynamic** (cloud) | Entra, via a membership rule such as `user.department -eq "Finance"` | Evaluated automatically in the cloud |
+
+### 1. Cloud-only groups
+
+The group is created and edited in Entra. This is the simplest option. Entra is the source of truth, and you can edit membership directly.
+
+### 2. Synced on-premises AD groups
+
+If your organization runs a traditional Windows domain, your groups probably exist in on-premises Active Directory. A sync agent copies them up to Entra. The important details:
+
+- **On-prem AD is the source of authority.** You change membership in AD. Entra shows a read-only copy, and edits made in the Entra portal to a synced group won't stick.
+- **Sync is not instant.** With Entra Connect Sync, the default delta cycle is about every 30 minutes. A user added to an AD group may not have the role in Entra for a while.
+- **Only security groups are useful here.** Distribution lists can sync but can't be assigned to app roles.
+- **The group must be in scope for sync.** Entra Connect filters by OU or attribute. If your `SG-UtilityHub-*` groups sit in an OU that isn't synced, they won't appear in Entra.
+
+### 3. Dynamic groups
+
+Membership is computed from user attributes. This requires **Entra ID P1** and works only for cloud-evaluated rules. You can't make an on-premises group dynamic.
+
+## How it connects to the app
+
+A common point of confusion is the chain between an on-prem AD group and a role in the token:
+
+```mermaid
+flowchart LR
+    A[On-prem AD group<br/>SG-UtilityHub-Finance] -->|Entra Connect sync<br/>~30 min delta| B[Entra ID group<br/>same name, synced copy]
+    C[Cloud-only group] --> B
+    B -->|assigned to app role<br/>on API Enterprise App| D[App role<br/>Utility4.Access]
+    D -->|resolved at sign-in| E[Access token<br/>roles claim]
+    E --> F[Express API<br/>requireRoles]
+```
+
+The **role assignment** (group → `Utility4.Access`) is always made in Entra, on the API's enterprise application. It doesn't matter whether the group itself was created in the cloud or synced from AD.
+
+## What this means for your design
+
+- **Admins can keep using AD.** If you have a domain and already manage access with AD security groups, you can keep doing that. Add the users to the synced group in AD, wait for sync, and the user gets the role on their next sign-in.
+- **The two delays stack.** After an AD change, you wait for the sync cycle. After the sync, the user still needs a new token, which means signing out and back in. A help desk adding someone to a group may not see an effect for 30+ minutes plus a fresh login.
+- **Nothing in the Express API changes.** The token carries a flat `roles` claim either way, so the code in `api/src/middleware/auth.js` is the same for cloud and synced groups.
+
+## Things to check in your own environment
+
+These determine which path applies to you, and I can't tell from the repo:
+
+1. **Do you have on-premises AD at all?** Cloud-only organizations won't have a sync layer.
+2. **Is Entra Connect or Cloud Sync installed and healthy?** Your identity team can confirm this.
+3. **Are your groups in a synced OU?** Groups outside the sync scope never show up in Entra.
+4. **Do you have Entra ID P1 or P2?** Assigning groups to app roles requires one of them. Without it, you assign roles to individual users, which loses the group-management benefit.
+5. **Are your groups security-enabled?** Only security groups, not mail-only distribution lists, can be assigned to app roles.
+
+## An alternative worth knowing about
+
+If you stay hybrid with on-premises AD and want groups to appear in tokens directly, there's a setting to emit **group claims** limited to groups assigned to the application ("Groups assigned to the application"). That avoids the overage problem I described earlier, but it puts group object IDs in the token instead of readable role names. I'd still recommend app roles for this project, because your code stays readable and the claim is already filtered to what the app cares about.
+
+If you tell me whether you have on-premises AD, and whether you know your Entra licensing tier, I can say which of these paths fits you best and whether the setup doc needs an on-prem sync section.
